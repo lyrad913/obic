@@ -1,0 +1,1 @@
+"""OBIC competition package."""
