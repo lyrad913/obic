@@ -6,7 +6,7 @@ from pathlib import Path
 from loguru import logger
 
 from src.config import TrainingConfig
-from src.pipeline import run_pipeline
+from src.pipeline import run_pipeline, run_inference
 
 
 def parse_args() -> argparse.Namespace:
@@ -23,6 +23,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patience", type=int, default=None, help="Early stopping patience")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
     parser.add_argument("--no-amp", action="store_true", help="Disable automatic mixed precision even if CUDA is available")
+    parser.add_argument("--checkpoint-path", type=Path, default=None, help="Path to a saved model checkpoint for inference")
+    parser.add_argument("--inference-only", action="store_true", help="Skip training and run inference with the provided checkpoint")
     return parser.parse_args()
 
 
@@ -57,8 +59,14 @@ def main() -> None:
     args = parse_args()
     config = TrainingConfig()
     apply_overrides(config, args)
-    logger.info(f"Starting pipeline with config: {config}")
-    run_pipeline(config)
+    if args.inference_only:
+        if args.checkpoint_path is None:
+            raise ValueError("--checkpoint-path must be provided when --inference-only is set")
+        logger.info(f"Starting inference with config: {config} and checkpoint: {args.checkpoint_path}")
+        run_inference(config, args.checkpoint_path)
+    else:
+        logger.info(f"Starting pipeline with config: {config}")
+        run_pipeline(config)
 
 
 if __name__ == "__main__":
