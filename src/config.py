@@ -25,6 +25,11 @@ class TrainingConfig:
     target_col: str = "nins"
     group_col: str = "pv_id"
     time_col: str = "time"
+    model_name: str = "feedforward"
+    pv_embedding_dim: int = 32
+    bce_weight: float = 1.0
+    regression_weight: float = 1.0
+    positive_threshold: float = 0.0
 
     def resolve_paths(self) -> None:
         self.data_dir = Path(self.data_dir)
@@ -35,3 +40,7 @@ class TrainingConfig:
     @property
     def checkpoint_dir(self) -> Path:
         return self.artifacts_dir / "checkpoints"
+
+    @property
+    def is_two_head(self) -> bool:
+        return self.model_name.lower() == "two_head"

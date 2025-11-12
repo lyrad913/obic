@@ -23,6 +23,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patience", type=int, default=None, help="Early stopping patience")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
     parser.add_argument("--no-amp", action="store_true", help="Disable automatic mixed precision even if CUDA is available")
+    parser.add_argument("--model", choices=["feedforward", "two_head"], default=None, help="Model architecture to train")
+    parser.add_argument("--pv-embedding-dim", type=int, default=None, help="Embedding dimension for pv_id when using two_head model")
+    parser.add_argument("--bce-weight", type=float, default=None, help="Loss weight for the classification head in the two_head model")
+    parser.add_argument("--reg-weight", type=float, default=None, help="Loss weight for the regression head in the two_head model")
+    parser.add_argument("--positive-threshold", type=float, default=None, help="Threshold to decide positive samples for the regression head")
     return parser.parse_args()
 
 
@@ -51,6 +56,16 @@ def apply_overrides(config: TrainingConfig, args: argparse.Namespace) -> None:
         config.seed = args.seed
     if args.no_amp:
         config.amp = False
+    if args.model is not None:
+        config.model_name = args.model
+    if args.pv_embedding_dim is not None:
+        config.pv_embedding_dim = args.pv_embedding_dim
+    if args.bce_weight is not None:
+        config.bce_weight = args.bce_weight
+    if args.reg_weight is not None:
+        config.regression_weight = args.reg_weight
+    if args.positive_threshold is not None:
+        config.positive_threshold = args.positive_threshold
 
 
 def main() -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -8,30 +9,45 @@ import numpy as np
 import polars as pl
 import torch
 from ignite.contrib.handlers import ProgressBar
-from ignite.engine import Events, create_supervised_evaluator, create_supervised_trainer
+from ignite.engine import Engine, Events, create_supervised_evaluator, create_supervised_trainer
 from ignite.handlers import EarlyStopping, ModelCheckpoint
 from ignite.metrics import MeanAbsoluteError, MeanSquaredError, RootMeanSquaredError, RunningAverage
 from loguru import logger
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
+from torch.cuda.amp import GradScaler, autocast
 
 from .config import TrainingConfig
 from .data import DataBundle, prepare_data
 from .metrics import NormalizedMAE
-from .model import FeedForwardRegressor
+from .model import FeedForwardRegressor, TwoHeadLoss, TwoHeadRegressor
 from .utils import resolve_device, set_seed
 
 
 def _prepare_loaders(bundle: DataBundle, config: TrainingConfig, device: torch.device) -> tuple[DataLoader, DataLoader]:
     pin_memory = device.type == "cuda"
-    train_dataset = TensorDataset(
-        torch.from_numpy(bundle.x_train),
-        torch.from_numpy(bundle.y_train),
-    )
-    val_dataset = TensorDataset(
-        torch.from_numpy(bundle.x_val),
-        torch.from_numpy(bundle.y_val),
-    )
+    if config.is_two_head:
+        if bundle.train_pv_indices is None or bundle.val_pv_indices is None:
+            raise ValueError("Two-head model requires pv_id indices in the data bundle.")
+        train_dataset = TensorDataset(
+            torch.from_numpy(bundle.x_train),
+            torch.from_numpy(bundle.train_pv_indices).long(),
+            torch.from_numpy(bundle.y_train),
+        )
+        val_dataset = TensorDataset(
+            torch.from_numpy(bundle.x_val),
+            torch.from_numpy(bundle.val_pv_indices).long(),
+            torch.from_numpy(bundle.y_val),
+        )
+    else:
+        train_dataset = TensorDataset(
+            torch.from_numpy(bundle.x_train),
+            torch.from_numpy(bundle.y_train),
+        )
+        val_dataset = TensorDataset(
+            torch.from_numpy(bundle.x_val),
+            torch.from_numpy(bundle.y_val),
+        )
     generator = torch.Generator()
     generator.manual_seed(config.seed)
     train_loader = DataLoader(
@@ -67,9 +83,23 @@ def _log_epoch_metrics(epoch: int, metrics: dict[str, float]) -> None:
     logger.info(f"epoch={epoch:03d} val_mae={mae:.4f} val_rmse={rmse:.4f} val_nmape={nmape:.2f}%")
 
 
-def _predict(model: nn.Module, features: np.ndarray, config: TrainingConfig, device: torch.device) -> np.ndarray:
+def _predict(
+    model: nn.Module,
+    features: np.ndarray,
+    config: TrainingConfig,
+    device: torch.device,
+    pv_indices: np.ndarray | None = None,
+) -> np.ndarray:
     pin_memory = device.type == "cuda"
-    dataset = TensorDataset(torch.from_numpy(features))
+    if config.is_two_head:
+        if pv_indices is None:
+            raise ValueError("Two-head model requires pv_id indices for prediction.")
+        dataset = TensorDataset(
+            torch.from_numpy(features),
+            torch.from_numpy(pv_indices).long(),
+        )
+    else:
+        dataset = TensorDataset(torch.from_numpy(features))
     loader = DataLoader(
         dataset,
         batch_size=config.eval_batch_size,
@@ -80,10 +110,20 @@ def _predict(model: nn.Module, features: np.ndarray, config: TrainingConfig, dev
     preds: list[torch.Tensor] = []
     model.eval()
     with torch.no_grad():
-        for (batch,) in loader:
-            batch = batch.to(device)
-            outputs = model(batch)
-            preds.append(outputs.clamp_min(0.0).to("cpu"))
+        for batch in loader:
+            if config.is_two_head:
+                feature_batch, pv_batch = batch
+                feature_batch = feature_batch.to(device)
+                pv_batch = pv_batch.to(device)
+                logits, regression = model(feature_batch, pv_batch)
+                positive_prob = torch.sigmoid(logits)
+                positive_energy = torch.relu(regression)
+                outputs = (positive_prob * positive_energy).clamp_min(0.0)
+            else:
+                (feature_batch,) = batch
+                feature_batch = feature_batch.to(device)
+                outputs = model(feature_batch).clamp_min(0.0)
+            preds.append(outputs.to("cpu"))
     if not preds:
         return np.array([], dtype=np.float32)
     return torch.cat(preds).numpy().astype(np.float32, copy=False)
@@ -163,32 +203,101 @@ def run_pipeline(config: TrainingConfig) -> dict[str, Any]:
         f"DataLoader 준비 완료 (train_batches={len(train_loader)}, val_batches={len(val_loader)})"
     )
 
-    model = FeedForwardRegressor(
-        input_dim=len(bundle.feature_names),
-        hidden_dims=config.hidden_dims,
-        dropout=config.dropout,
-    ).to(device)
+    if config.is_two_head:
+        if bundle.pv_id_mapping is None:
+            raise ValueError("Two-head model requires pv_id mapping in the data bundle.")
+        pv_vocab_size = len(bundle.pv_id_mapping)
+        if pv_vocab_size == 0:
+            raise ValueError("pv_id vocabulary is empty; cannot build embedding layer.")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
-    loss_fn = nn.SmoothL1Loss()
+        model = TwoHeadRegressor(
+            input_dim=len(bundle.feature_names),
+            hidden_dims=config.hidden_dims,
+            dropout=config.dropout,
+            pv_vocab_size=pv_vocab_size,
+            pv_embedding_dim=config.pv_embedding_dim,
+        ).to(device)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+        criterion = TwoHeadLoss(
+            bce_weight=config.bce_weight,
+            regression_weight=config.regression_weight,
+            positive_threshold=config.positive_threshold,
+        )
 
-    amp_mode = _resolve_amp_mode(device, config.amp)
+        amp_mode = _resolve_amp_mode(device, config.amp)
+        amp_enabled = amp_mode == "amp"
+        scaler = GradScaler(enabled=amp_enabled)
+        autocast_cm = autocast if amp_enabled else nullcontext
 
-    trainer = create_supervised_trainer(
-        model,
-        optimizer,
-        loss_fn,
-        device=device,
-        amp_mode=amp_mode,
-    )
+        def _two_head_train_step(engine, batch):
+            model.train()
+            optimizer.zero_grad(set_to_none=True)
+            features, pv_idx, targets = batch
+            features = features.to(device)
+            pv_idx = pv_idx.to(device)
+            targets = targets.to(device)
+            with autocast_cm():
+                logits, regression = model(features, pv_idx)
+                loss = criterion((logits, regression), targets)
+            if amp_enabled:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
+            return loss.item()
 
-    metrics = {
-        "mae": MeanAbsoluteError(),
-        "mse": MeanSquaredError(),
-        "rmse": RootMeanSquaredError(),
-        "norm_mae": NormalizedMAE(),
-    }
-    evaluator = create_supervised_evaluator(model, metrics=metrics, device=device)
+        def _two_head_eval_step(engine, batch):
+            model.eval()
+            with torch.no_grad():
+                features, pv_idx, targets = batch
+                features = features.to(device)
+                pv_idx = pv_idx.to(device)
+                targets = targets.to(device)
+                logits, regression = model(features, pv_idx)
+                positive_prob = torch.sigmoid(logits)
+                positive_energy = torch.relu(regression)
+                predictions = (positive_prob * positive_energy).clamp_min(0.0)
+            return predictions, targets
+
+        trainer = Engine(_two_head_train_step)
+        metrics = {
+            "mae": MeanAbsoluteError(),
+            "mse": MeanSquaredError(),
+            "rmse": RootMeanSquaredError(),
+            "norm_mae": NormalizedMAE(),
+        }
+        evaluator = Engine(_two_head_eval_step)
+        for name, metric in metrics.items():
+            metric.attach(evaluator, name)
+    else:
+        model = FeedForwardRegressor(
+            input_dim=len(bundle.feature_names),
+            hidden_dims=config.hidden_dims,
+            dropout=config.dropout,
+        ).to(device)
+
+        optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+        loss_fn = nn.SmoothL1Loss()
+
+        amp_mode = _resolve_amp_mode(device, config.amp)
+
+        trainer = create_supervised_trainer(
+            model,
+            optimizer,
+            loss_fn,
+            device=device,
+            amp_mode=amp_mode,
+        )
+
+        metrics = {
+            "mae": MeanAbsoluteError(),
+            "mse": MeanSquaredError(),
+            "rmse": RootMeanSquaredError(),
+            "norm_mae": NormalizedMAE(),
+        }
+        evaluator = create_supervised_evaluator(model, metrics=metrics, device=device)
 
     checkpointer = _attach_callbacks(
         trainer,
@@ -215,7 +324,13 @@ def run_pipeline(config: TrainingConfig) -> dict[str, Any]:
     val_metrics = evaluator.run(val_loader).metrics
     _log_epoch_metrics(trainer.state.epoch, val_metrics)
 
-    predictions = _predict(model, bundle.x_test, config, device)
+    predictions = _predict(
+        model,
+        bundle.x_test,
+        config,
+        device,
+        bundle.test_pv_indices if config.is_two_head else None,
+    )
     submission_path = _save_submission(predictions, bundle, config)
 
     metrics_payload = {

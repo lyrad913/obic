@@ -39,6 +39,10 @@ class DataBundle:
     test_meta: pl.DataFrame
     submission_template: pl.DataFrame
     scaler: StandardScaler
+    train_pv_indices: np.ndarray | None = None
+    val_pv_indices: np.ndarray | None = None
+    test_pv_indices: np.ndarray | None = None
+    pv_id_mapping: dict[str, int] | None = None
 
 
 def load_raw_frames(data_dir: Path) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
@@ -79,6 +83,8 @@ def add_time_features(df: pl.DataFrame, time_col: str) -> pl.DataFrame:
             (pl.col("hour") * two_pi / 24.0).cos().alias("hour_cos"),
             (pl.col("day_of_year") * two_pi / 365.0).sin().alias("day_of_year_sin"),
             (pl.col("day_of_year") * two_pi / 365.0).cos().alias("day_of_year_cos"),
+            ((pl.col("month") - 1) * two_pi / 12.0).sin().alias("month_sin"),
+            ((pl.col("month") - 1) * two_pi / 12.0).cos().alias("month_cos"),
         ]
     )
 
@@ -131,7 +137,7 @@ def select_numerical_columns(df: pl.DataFrame, exclude: Iterable[str]) -> list[s
     ]
 
 
-def preprocess_frames(config: TrainingConfig) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+def preprocess_frames(config: TrainingConfig) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, dict[str, int]]:
     logger.info("전처리를 시작합니다.")
     train_df, test_df, submission_df = load_raw_frames(config.data_dir)
     train_df = add_time_features(train_df, config.time_col)
@@ -148,7 +154,21 @@ def preprocess_frames(config: TrainingConfig) -> tuple[pl.DataFrame, pl.DataFram
     train_df = train_df.filter(pl.col(config.target_col).is_not_null())
     logger.info(f"타깃 결측 행 제거 후 train={train_df.height} rows")
 
-    feature_exclude = {config.target_col, config.group_col, config.time_col, "type"}
+    pv_union = pl.concat([
+        train_df.select(config.group_col).unique(),
+        test_df.select(config.group_col).unique(),
+    ]).unique()
+    pv_vocab = sorted(pv_union.select(config.group_col).to_series().to_list())
+    pv_mapping = {pv: idx for idx, pv in enumerate(pv_vocab)}
+
+    train_df = train_df.with_columns(
+        pl.col(config.group_col).replace(pv_mapping).cast(pl.Int32).alias("pv_idx")
+    )
+    test_df = test_df.with_columns(
+        pl.col(config.group_col).replace(pv_mapping).cast(pl.Int32).alias("pv_idx")
+    )
+
+    feature_exclude = {config.target_col, config.group_col, config.time_col, "type", "pv_idx"}
     feature_columns = select_numerical_columns(train_df, feature_exclude)
     logger.info(f"선택된 피처 수: {len(feature_columns)}")
 
@@ -160,7 +180,7 @@ def preprocess_frames(config: TrainingConfig) -> tuple[pl.DataFrame, pl.DataFram
     test_df = test_df.with_columns([pl.col(col).cast(pl.Float32) for col in feature_columns])
     logger.debug("데이터 타입 캐스팅 완료.")
 
-    return train_df, test_df, submission_df
+    return train_df, test_df, submission_df, pv_mapping
 
 
 def split_train_validation(
@@ -186,8 +206,8 @@ def to_numpy(df: pl.DataFrame, columns: Sequence[str]) -> np.ndarray:
 
 
 def prepare_data(config: TrainingConfig) -> DataBundle:
-    train_df, test_df, submission_df = preprocess_frames(config)
-    feature_exclude = {config.target_col, config.group_col, config.time_col, "type"}
+    train_df, test_df, submission_df, pv_mapping = preprocess_frames(config)
+    feature_exclude = {config.target_col, config.group_col, config.time_col, "type", "pv_idx"}
     feature_columns = select_numerical_columns(train_df, feature_exclude)
     feature_columns = sorted(feature_columns)
 
@@ -225,6 +245,10 @@ def prepare_data(config: TrainingConfig) -> DataBundle:
         test_meta = test_meta.with_columns(pl.lit("test").alias("type"))
     submission_meta = submission_df.select(["time", "pv_id", "type"])
 
+    train_pv_indices = train_split.select("pv_idx").to_numpy().astype(np.int64, copy=False).ravel()
+    val_pv_indices = val_split.select("pv_idx").to_numpy().astype(np.int64, copy=False).ravel()
+    test_pv_indices = test_df.select("pv_idx").to_numpy().astype(np.int64, copy=False).ravel()
+
     return DataBundle(
         feature_names=feature_columns,
         x_train=x_train,
@@ -237,4 +261,8 @@ def prepare_data(config: TrainingConfig) -> DataBundle:
         test_meta=test_meta,
         submission_template=submission_meta,
         scaler=scaler,
+        train_pv_indices=train_pv_indices,
+        val_pv_indices=val_pv_indices,
+        test_pv_indices=test_pv_indices,
+        pv_id_mapping=pv_mapping,
     )
