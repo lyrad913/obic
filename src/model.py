@@ -41,8 +41,12 @@ class TwoHeadRegressor(nn.Module):
         super().__init__()
         self.pv_embedding = nn.Embedding(pv_vocab_size, pv_embedding_dim)
 
+        combined_dim = input_dim + pv_embedding_dim
+        self.feature_norm = nn.LayerNorm(combined_dim)
+        self.feature_dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
+
         layers: list[nn.Module] = []
-        prev_dim = input_dim + pv_embedding_dim
+        prev_dim = combined_dim
         for hidden_dim in hidden_dims:
             layers.append(nn.Linear(prev_dim, hidden_dim))
             layers.append(nn.GELU())
@@ -56,11 +60,13 @@ class TwoHeadRegressor(nn.Module):
         self.classifier_head = nn.Sequential(
             nn.Linear(head_input_dim, head_hidden_dim),
             nn.GELU(),
+            nn.Dropout(dropout) if dropout > 0.0 else nn.Identity(),
             nn.Linear(head_hidden_dim, 1),
         )
         self.regression_head = nn.Sequential(
             nn.Linear(head_input_dim, head_hidden_dim),
             nn.GELU(),
+            nn.Dropout(dropout) if dropout > 0.0 else nn.Identity(),
             nn.Linear(head_hidden_dim, 1),
             nn.ReLU(),
         )
@@ -68,6 +74,8 @@ class TwoHeadRegressor(nn.Module):
     def forward(self, inputs: torch.Tensor, pv_indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         emb = self.pv_embedding(pv_indices)
         features = torch.cat([inputs, emb], dim=-1)
+        features = self.feature_norm(features)
+        features = self.feature_dropout(features)
         representation = self.backbone(features)
         logits = self.classifier_head(representation).squeeze(-1)
         regression = self.regression_head(representation).squeeze(-1)
@@ -80,6 +88,7 @@ class TwoHeadLoss(nn.Module):
         bce_weight: float = 1.0,
         regression_weight: float = 1.0,
         positive_threshold: float = 0.0,
+        label_smoothing: float = 0.0,
         eps: float = 1e-6,
     ) -> None:
         super().__init__()
@@ -87,6 +96,7 @@ class TwoHeadLoss(nn.Module):
         self.regression_weight = regression_weight
         self.threshold = positive_threshold
         self.eps = eps
+        self.label_smoothing = max(0.0, min(0.499, label_smoothing))
         self._bce = nn.BCEWithLogitsLoss()
         self._reg = nn.SmoothL1Loss(reduction="none")
 
@@ -94,8 +104,12 @@ class TwoHeadLoss(nn.Module):
         logits, regression = outputs
         target = target.float()
         positive_mask = (target > self.threshold).float()
+        if self.label_smoothing > 0.0:
+            smoothed = positive_mask * (1.0 - self.label_smoothing) + 0.5 * self.label_smoothing
+        else:
+            smoothed = positive_mask
 
-        classification_loss = self._bce(logits, positive_mask)
+        classification_loss = self._bce(logits, smoothed)
 
         reg_losses = self._reg(regression, target)
         weighted_reg_loss = (reg_losses * positive_mask).sum()

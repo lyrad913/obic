@@ -1,21 +1,27 @@
 from __future__ import annotations
 
+import importlib
 import json
+import math
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
+import joblib
 import numpy as np
+import pandas as pd
 import polars as pl
 import torch
 from ignite.contrib.handlers import ProgressBar
 from ignite.engine import Engine, Events, create_supervised_evaluator, create_supervised_trainer
-from ignite.handlers import EarlyStopping, ModelCheckpoint
+from ignite.handlers import EarlyStopping
 from ignite.metrics import MeanAbsoluteError, MeanSquaredError, RootMeanSquaredError, RunningAverage
 from loguru import logger
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 from torch.cuda.amp import GradScaler, autocast
+from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 from .config import TrainingConfig
 from .data import DataBundle, prepare_data
@@ -129,6 +135,51 @@ def _predict(
     return torch.cat(preds).numpy().astype(np.float32, copy=False)
 
 
+class CheckpointManager:
+    def __init__(self, config: TrainingConfig) -> None:
+        self.config = config
+        self.max_checkpoints = max(1, config.max_checkpoints)
+        self._records: list[tuple[float, Path]] = []
+        self.best_path: Path | None = None
+
+    def _build_path(self, epoch: int, mae: float, extension: str) -> Path:
+        run_name = self.config.checkpoint_prefix
+        filename = f"{run_name}-epoch{epoch:03d}-mae={mae:.4f}{extension}"
+        return self.config.checkpoint_dir / filename
+
+    def _register(self, mae: float, path: Path) -> None:
+        self._records.append((mae, path))
+        self._records.sort(key=lambda item: item[0])
+        while len(self._records) > self.max_checkpoints:
+            _, worst_path = self._records.pop(-1)
+            try:
+                worst_path.unlink()
+            except FileNotFoundError:
+                pass
+        self.best_path = self._records[0][1] if self._records else None
+
+    def save_torch_model(self, model: nn.Module, metrics: dict[str, float], epoch: int) -> None:
+        mae = metrics.get("mae")
+        if mae is None or not math.isfinite(mae):
+            return
+        path = self._build_path(epoch, mae, ".pt")
+        payload = {
+            "model": model.state_dict(),
+            "epoch": epoch,
+            "metrics": metrics,
+        }
+        torch.save(payload, path)
+        self._register(mae, path)
+
+    def save_joblib(self, payload: Any, mae: float, epoch: int) -> Path | None:
+        if not math.isfinite(mae):
+            return None
+        path = self._build_path(epoch, mae, ".joblib")
+        joblib.dump(payload, path)
+        self._register(mae, path)
+        return path
+
+
 def _save_submission(
     predictions: np.ndarray,
     bundle: DataBundle,
@@ -154,9 +205,9 @@ def _attach_callbacks(
     evaluator,
     val_loader,
     config: TrainingConfig,
-    checkpoint_dir: Path,
     model: nn.Module,
-) -> ModelCheckpoint:
+) -> CheckpointManager:
+    checkpoint_manager = CheckpointManager(config)
     RunningAverage(alpha=0.98, output_transform=lambda output: output).attach(trainer, "loss")
     ProgressBar(desc="Training").attach(trainer, metric_names=["loss"])
 
@@ -166,37 +217,356 @@ def _attach_callbacks(
     handler = EarlyStopping(patience=config.patience, score_function=score_function, trainer=trainer)
     evaluator.add_event_handler(Events.COMPLETED, handler)
 
-    checkpointer = ModelCheckpoint(
-        dirname=str(checkpoint_dir),
-        filename_prefix="regressor",
-        n_saved=1,
-        score_name="val_mae",
-        score_function=score_function,
-        global_step_transform=lambda *_: trainer.state.epoch,
-        require_empty=False,
-    )
-    evaluator.add_event_handler(Events.COMPLETED, checkpointer, {"model": model})
-
     @trainer.on(Events.EPOCH_COMPLETED)
     def _run_validation(engine):
         evaluator.run(val_loader)
         metrics = evaluator.state.metrics
         _log_epoch_metrics(engine.state.epoch, metrics)
+        checkpoint_manager.save_torch_model(model, metrics, engine.state.epoch)
+    return checkpoint_manager
 
-    return checkpointer
+
+def _compute_normalized_mae(y_true: np.ndarray, y_pred: np.ndarray, eps: float = 1e-6) -> float:
+    denominator = np.abs(y_true).mean() + eps
+    if denominator <= eps:
+        return 0.0
+    return float(np.abs(y_true - y_pred).mean() / denominator * 100.0)
+
+
+def _run_hist_gradient_boosting(bundle: DataBundle, config: TrainingConfig) -> dict[str, Any]:
+    logger.info("HistGradientBoosting 기반 Two-Stage 모델을 학습합니다.")
+
+    x_train = np.ascontiguousarray(bundle.x_train)
+    y_train = bundle.y_train
+    x_val = np.ascontiguousarray(bundle.x_val)
+    y_val = bundle.y_val
+    x_test = np.ascontiguousarray(bundle.x_test)
+
+    threshold = config.positive_threshold
+    positive_ratio = float((y_train > threshold).mean())
+    logger.info(f"학습 타깃 양수 비율: {positive_ratio:.3f}")
+
+    if config.tree_subsample < 1.0:
+        full_size = x_train.shape[0]
+        subset_size = max(1, int(full_size * config.tree_subsample))
+        if subset_size < full_size:
+            rng = np.random.default_rng(config.seed)
+            indices = rng.choice(full_size, size=subset_size, replace=False)
+            x_train_sub = x_train[indices]
+            y_train_sub = y_train[indices]
+            logger.info(f"서브샘플링 적용: {subset_size}/{full_size} ({config.tree_subsample:.2f})")
+        else:
+            x_train_sub = x_train
+            y_train_sub = y_train
+    else:
+        x_train_sub = x_train
+        y_train_sub = y_train
+
+    y_train_binary = (y_train_sub > threshold).astype(np.int8)
+    classifier = HistGradientBoostingClassifier(
+        max_iter=config.tree_max_iter,
+        learning_rate=config.tree_learning_rate,
+        max_depth=config.tree_max_depth,
+        l2_regularization=config.tree_l2_regularization,
+        max_bins=config.tree_max_bins,
+        min_samples_leaf=config.tree_min_samples_leaf,
+        random_state=config.seed,
+    )
+    classifier.fit(x_train_sub, y_train_binary)
+    logger.info("분류 헤드 학습 완료")
+
+    positive_mask = y_train_sub > threshold
+    regressor: HistGradientBoostingRegressor | None = None
+    if positive_mask.any():
+        regressor = HistGradientBoostingRegressor(
+            max_iter=config.tree_max_iter,
+            learning_rate=config.tree_learning_rate,
+            max_depth=config.tree_max_depth,
+            l2_regularization=config.tree_l2_regularization,
+            max_bins=config.tree_max_bins,
+            min_samples_leaf=config.tree_min_samples_leaf,
+            random_state=config.seed,
+        )
+        regressor.fit(x_train_sub[positive_mask], y_train_sub[positive_mask])
+        logger.info("회귀 헤드 학습 완료")
+    else:
+        logger.warning("양수 샘플이 없어 회귀 헤드를 학습하지 못했습니다. 모든 예측을 0으로 대체합니다.")
+
+    prob_val = classifier.predict_proba(x_val)[:, 1]
+    reg_val = np.zeros_like(y_val, dtype=np.float64)
+    if regressor is not None:
+        reg_val = np.clip(regressor.predict(x_val), 0.0, None)
+    val_predictions = np.clip(prob_val * reg_val, 0.0, None)
+
+    val_mae = mean_absolute_error(y_val, val_predictions)
+    val_rmse = math.sqrt(mean_squared_error(y_val, val_predictions))
+    val_nmape = _compute_normalized_mae(y_val, val_predictions)
+
+    prob_test = classifier.predict_proba(x_test)[:, 1]
+    reg_test = np.zeros(x_test.shape[0], dtype=np.float64)
+    if regressor is not None:
+        reg_test = np.clip(regressor.predict(x_test), 0.0, None)
+    test_predictions = np.clip(prob_test * reg_test, 0.0, None).astype(np.float32)
+
+    checkpoint_manager = CheckpointManager(config)
+    payload = {
+        "classifier": classifier,
+        "regressor": regressor,
+        "threshold": threshold,
+        "metrics": {
+            "mae": val_mae,
+            "rmse": val_rmse,
+            "nmape": val_nmape,
+        },
+    }
+    checkpoint_path = checkpoint_manager.save_joblib(payload, val_mae, epoch=0)
+    if checkpoint_path is not None:
+        logger.info(f"모델을 저장했습니다: {checkpoint_path}")
+
+    submission_path = _save_submission(test_predictions, bundle, config)
+
+    metrics_payload = {
+        "mae": val_mae,
+        "rmse": val_rmse,
+        "nmape": val_nmape,
+    }
+    logger.info(f"Validation metrics: {json.dumps(metrics_payload, default=float)}")
+    logger.info(f"Submission saved to {submission_path}")
+
+    result: dict[str, Any] = {
+        "device": "cpu",
+        "feature_count": len(bundle.feature_names),
+        "val_metrics": metrics_payload,
+        "submission_path": str(submission_path),
+    }
+    if checkpoint_path is not None:
+        result["checkpoint_path"] = str(checkpoint_path)
+    return result
+
+
+def _run_lightgbm(bundle: DataBundle, config: TrainingConfig) -> dict[str, Any]:
+    if bundle.train_frame is None or bundle.val_frame is None or bundle.test_frame is None:
+        raise ValueError("LightGBM 실행을 위해서는 train/val/test 프레임이 필요합니다.")
+
+    logger.info("LightGBM 기반 Two-Stage 모델을 학습합니다.")
+
+    try:
+        lightgbm = importlib.import_module("lightgbm")
+    except ImportError as exc:  # pragma: no cover - defensive guard
+        raise ImportError(
+            "LightGBM 패키지가 설치되어 있지 않습니다. `uv pip install lightgbm` 이후 다시 시도해주세요."
+        ) from exc
+
+    LGBMClassifier = lightgbm.LGBMClassifier
+    LGBMRegressor = lightgbm.LGBMRegressor
+    early_stopping = lightgbm.early_stopping
+    log_evaluation = lightgbm.log_evaluation
+
+    threshold = config.positive_threshold
+    cat_features = list(bundle.categorical_features or [])
+
+    train_pl = bundle.train_frame
+    val_pl = bundle.val_frame
+    test_pl = bundle.test_frame
+
+    total_train = train_pl.height
+    rng = np.random.default_rng(config.seed)
+    if 0.0 < config.lgbm_sample_fraction < 1.0:
+        subset_size = max(1, int(total_train * config.lgbm_sample_fraction))
+        subset_idx = np.sort(rng.choice(total_train, size=subset_size, replace=False))
+        logger.info(
+            "LightGBM 학습 데이터를 서브샘플링합니다: {}/{} ({:.2f})",
+            subset_size,
+            total_train,
+            config.lgbm_sample_fraction,
+        )
+        index_frame = pl.DataFrame({"_row_idx": subset_idx.tolist()})
+        train_pl_sub = (
+            train_pl.with_row_count("_row_idx")
+            .join(index_frame, on="_row_idx", how="inner")
+            .sort("_row_idx")
+            .drop("_row_idx")
+        )
+        y_train_sub = bundle.y_train[subset_idx]
+    else:
+        train_pl_sub = train_pl
+        y_train_sub = bundle.y_train
+    y_val = bundle.y_val
+
+    train_df = train_pl_sub.to_pandas()
+    val_df = val_pl.to_pandas()
+    test_df = test_pl.to_pandas()
+
+    for cat in cat_features:
+        if cat not in train_df.columns:
+            continue
+        categories = np.unique(
+            np.concatenate(
+                [
+                    train_df[cat].to_numpy(copy=False),
+                    val_df[cat].to_numpy(copy=False),
+                    test_df[cat].to_numpy(copy=False),
+                ]
+            )
+        )
+        train_df[cat] = pd.Categorical(train_df[cat], categories=categories)
+        val_df[cat] = pd.Categorical(val_df[cat], categories=categories)
+        test_df[cat] = pd.Categorical(test_df[cat], categories=categories)
+
+    y_train_binary = (y_train_sub > threshold).astype(np.int8)
+    y_val_binary = (y_val > threshold).astype(np.int8)
+
+    classifier = LGBMClassifier(
+        n_estimators=config.lgbm_n_estimators,
+        learning_rate=config.lgbm_learning_rate,
+        num_leaves=config.lgbm_num_leaves,
+        max_depth=config.lgbm_max_depth,
+        min_child_samples=config.lgbm_min_child_samples,
+        subsample=config.lgbm_bagging_fraction,
+        subsample_freq=config.lgbm_bagging_freq,
+        colsample_bytree=config.lgbm_feature_fraction,
+        reg_lambda=config.lgbm_lambda_l2,
+        random_state=config.seed,
+        objective="binary",
+        n_jobs=config.num_workers if config.num_workers > 0 else -1,
+    )
+
+    clf_eval_sets = []
+    if val_df.shape[0] > 0:
+        clf_eval_sets.append((val_df, y_val_binary))
+    clf_callbacks = []
+    if config.lgbm_log_evaluation_period > 0:
+        clf_callbacks.append(log_evaluation(config.lgbm_log_evaluation_period))
+    if clf_eval_sets and config.lgbm_early_stopping_rounds > 0:
+        clf_callbacks.append(early_stopping(config.lgbm_early_stopping_rounds, verbose=False))
+
+    classifier.fit(
+        train_df,
+        y_train_binary,
+        eval_set=clf_eval_sets or None,
+        eval_metric="binary_logloss",
+        categorical_feature=cat_features or "auto",
+        callbacks=clf_callbacks or None,
+    )
+    logger.info("LightGBM 분류 헤드 학습 완료")
+
+    regressor: Any | None = None
+    positive_mask = y_train_sub > threshold
+    val_positive_mask = y_val > threshold
+    if positive_mask.any():
+        reg_train_df = train_df.loc[positive_mask]
+        reg_target = y_train_sub[positive_mask]
+        regressor = LGBMRegressor(
+            n_estimators=config.lgbm_n_estimators,
+            learning_rate=config.lgbm_learning_rate,
+            num_leaves=config.lgbm_num_leaves,
+            max_depth=config.lgbm_max_depth,
+            min_child_samples=config.lgbm_min_child_samples,
+            subsample=config.lgbm_bagging_fraction,
+            subsample_freq=config.lgbm_bagging_freq,
+            colsample_bytree=config.lgbm_feature_fraction,
+            reg_lambda=config.lgbm_lambda_l2,
+            random_state=config.seed,
+            objective="regression_l1",
+            n_jobs=config.num_workers if config.num_workers > 0 else -1,
+        )
+        reg_eval_sets = []
+        if val_positive_mask.any():
+            reg_eval_sets.append((val_df.loc[val_positive_mask], y_val[val_positive_mask]))
+        reg_callbacks = []
+        if config.lgbm_log_evaluation_period > 0:
+            reg_callbacks.append(log_evaluation(config.lgbm_log_evaluation_period))
+        if reg_eval_sets and config.lgbm_early_stopping_rounds > 0:
+            reg_callbacks.append(early_stopping(config.lgbm_early_stopping_rounds, verbose=False))
+
+        regressor.fit(
+            reg_train_df,
+            reg_target,
+            eval_set=reg_eval_sets or None,
+            eval_metric="l1",
+            categorical_feature=cat_features or "auto",
+            callbacks=reg_callbacks or None,
+        )
+        logger.info("LightGBM 회귀 헤드 학습 완료")
+    else:
+        logger.warning("양수 타깃 샘플이 없어 회귀 헤드를 학습하지 못했습니다. 모든 양수 추론을 0으로 대체합니다.")
+
+    prob_val = classifier.predict_proba(val_df)[:, 1]
+    reg_val = np.zeros_like(y_val, dtype=np.float64)
+    if regressor is not None:
+        reg_val = np.clip(regressor.predict(val_df), 0.0, None)
+    val_predictions = np.clip(prob_val * reg_val, 0.0, None)
+
+    prob_test = classifier.predict_proba(test_df)[:, 1]
+    reg_test = np.zeros(test_df.shape[0], dtype=np.float64)
+    if regressor is not None:
+        reg_test = np.clip(regressor.predict(test_df), 0.0, None)
+    test_predictions = np.clip(prob_test * reg_test, 0.0, None).astype(np.float32, copy=False)
+
+    val_mae = mean_absolute_error(y_val, val_predictions)
+    val_rmse = math.sqrt(mean_squared_error(y_val, val_predictions))
+    val_nmape = _compute_normalized_mae(y_val, val_predictions)
+
+    checkpoint_manager = CheckpointManager(config)
+    payload = {
+        "classifier": classifier,
+        "regressor": regressor,
+        "threshold": threshold,
+        "categorical_features": cat_features,
+        "metrics": {
+            "mae": val_mae,
+            "rmse": val_rmse,
+            "nmape": val_nmape,
+        },
+    }
+    checkpoint_path = checkpoint_manager.save_joblib(payload, val_mae, epoch=0)
+    if checkpoint_path is not None:
+        logger.info(f"모델을 저장했습니다: {checkpoint_path}")
+
+    submission_path = _save_submission(test_predictions, bundle, config)
+
+    metrics_payload = {
+        "mae": val_mae,
+        "rmse": val_rmse,
+        "nmape": val_nmape,
+    }
+    logger.info(f"Validation metrics: {json.dumps(metrics_payload, default=float)}")
+    logger.info(f"Submission saved to {submission_path}")
+
+    result: dict[str, Any] = {
+        "device": "cpu",
+        "feature_count": len(bundle.feature_names),
+        "val_metrics": metrics_payload,
+        "submission_path": str(submission_path),
+    }
+    if checkpoint_path is not None:
+        result["checkpoint_path"] = str(checkpoint_path)
+    return result
 
 
 def run_pipeline(config: TrainingConfig) -> dict[str, Any]:
+    if config.is_tree_model and config.scale_features:
+        logger.info("Tree-based model을 선택해 스케일링을 비활성화합니다.")
+        config.scale_features = False
+
     config.resolve_paths()
     set_seed(config.seed)
-    device = resolve_device()
-    logger.info(f"Using device {device}")
 
     bundle = prepare_data(config)
     logger.info(f"Loaded dataset with {len(bundle.feature_names)} features")
     logger.info(
         f"학습 샘플: {bundle.x_train.shape[0]}, 검증 샘플: {bundle.x_val.shape[0]}, 테스트 샘플: {bundle.x_test.shape[0]}"
     )
+
+    if config.is_tree_model:
+        if config.is_hist_gbdt:
+            return _run_hist_gradient_boosting(bundle, config)
+        if config.is_lightgbm:
+            return _run_lightgbm(bundle, config)
+        raise ValueError(f"Unsupported tree model name: {config.model_name}")
+
+    device = resolve_device()
+    logger.info(f"Using device {device}")
 
     train_loader, val_loader = _prepare_loaders(bundle, config, device)
     logger.info(
@@ -222,6 +592,7 @@ def run_pipeline(config: TrainingConfig) -> dict[str, Any]:
             bce_weight=config.bce_weight,
             regression_weight=config.regression_weight,
             positive_threshold=config.positive_threshold,
+            label_smoothing=config.bce_label_smoothing,
         )
 
         amp_mode = _resolve_amp_mode(device, config.amp)
@@ -299,25 +670,25 @@ def run_pipeline(config: TrainingConfig) -> dict[str, Any]:
         }
         evaluator = create_supervised_evaluator(model, metrics=metrics, device=device)
 
-    checkpointer = _attach_callbacks(
+    checkpoint_manager = _attach_callbacks(
         trainer,
         evaluator,
         val_loader,
         config,
-        config.checkpoint_dir,
         model,
     )
 
     logger.info(f"Starting training for up to {config.max_epochs} epochs")
     trainer.run(train_loader, max_epochs=config.max_epochs)
 
-    if checkpointer.last_checkpoint is not None:
-        checkpoint = torch.load(checkpointer.last_checkpoint, map_location=device)
+    best_checkpoint_path = checkpoint_manager.best_path
+    if best_checkpoint_path is not None:
+        checkpoint = torch.load(best_checkpoint_path, map_location=device)
         state_dict = checkpoint.get("model") if isinstance(checkpoint, dict) else None
         if state_dict is None:
             state_dict = checkpoint
         model.load_state_dict(state_dict)
-        logger.info(f"Loaded best model from {checkpointer.last_checkpoint}")
+        logger.info(f"Loaded best model from {best_checkpoint_path}")
     else:
         logger.warning("No checkpoint was saved during training.")
 

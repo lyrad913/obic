@@ -38,11 +38,15 @@ class DataBundle:
     val_meta: pl.DataFrame
     test_meta: pl.DataFrame
     submission_template: pl.DataFrame
-    scaler: StandardScaler
+    scaler: StandardScaler | None
     train_pv_indices: np.ndarray | None = None
     val_pv_indices: np.ndarray | None = None
     test_pv_indices: np.ndarray | None = None
     pv_id_mapping: dict[str, int] | None = None
+    train_frame: pl.DataFrame | None = None
+    val_frame: pl.DataFrame | None = None
+    test_frame: pl.DataFrame | None = None
+    categorical_features: Sequence[str] | None = None
 
 
 def load_raw_frames(data_dir: Path) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
@@ -168,16 +172,27 @@ def preprocess_frames(config: TrainingConfig) -> tuple[pl.DataFrame, pl.DataFram
         pl.col(config.group_col).replace(pv_mapping).cast(pl.Int32).alias("pv_idx")
     )
 
-    feature_exclude = {config.target_col, config.group_col, config.time_col, "type", "pv_idx"}
+    feature_exclude = {config.target_col, config.group_col, config.time_col, "type"}
+    if not config.is_tree_model:
+        feature_exclude.add("pv_idx")
     feature_columns = select_numerical_columns(train_df, feature_exclude)
+    if config.is_tree_model and "pv_idx" not in feature_columns and "pv_idx" in train_df.columns:
+        feature_columns.append("pv_idx")
+    feature_columns = sorted(feature_columns)
     logger.info(f"선택된 피처 수: {len(feature_columns)}")
 
     train_df = fill_missing_by_group(train_df, config.group_col, config.time_col, feature_columns)
     test_df = fill_missing_by_group(test_df, config.group_col, config.time_col, feature_columns)
     logger.info("결측치 보간을 완료했습니다.")
 
-    train_df = train_df.with_columns([pl.col(col).cast(pl.Float32) for col in feature_columns + [config.target_col]])
-    test_df = test_df.with_columns([pl.col(col).cast(pl.Float32) for col in feature_columns])
+    train_cast_expr = []
+    test_cast_expr = []
+    for col in feature_columns:
+        dtype = pl.Int32 if col == "pv_idx" else pl.Float32
+        train_cast_expr.append(pl.col(col).cast(dtype))
+        test_cast_expr.append(pl.col(col).cast(dtype))
+    train_df = train_df.with_columns(train_cast_expr + [pl.col(config.target_col).cast(pl.Float32)])
+    test_df = test_df.with_columns(test_cast_expr)
     logger.debug("데이터 타입 캐스팅 완료.")
 
     return train_df, test_df, submission_df, pv_mapping
@@ -207,9 +222,16 @@ def to_numpy(df: pl.DataFrame, columns: Sequence[str]) -> np.ndarray:
 
 def prepare_data(config: TrainingConfig) -> DataBundle:
     train_df, test_df, submission_df, pv_mapping = preprocess_frames(config)
-    feature_exclude = {config.target_col, config.group_col, config.time_col, "type", "pv_idx"}
+    feature_exclude = {config.target_col, config.group_col, config.time_col, "type"}
+    if not config.is_tree_model:
+        feature_exclude.add("pv_idx")
     feature_columns = select_numerical_columns(train_df, feature_exclude)
+    if config.is_tree_model and "pv_idx" not in feature_columns and "pv_idx" in train_df.columns:
+        feature_columns.append("pv_idx")
     feature_columns = sorted(feature_columns)
+    categorical_features: list[str] = []
+    if config.is_tree_model and "pv_idx" in feature_columns:
+        categorical_features.append("pv_idx")
 
     train_split, val_split = split_train_validation(train_df, config)
     train_groups = train_split.select(config.group_col).n_unique()
@@ -218,12 +240,27 @@ def prepare_data(config: TrainingConfig) -> DataBundle:
         f"검증 세트 분할 완료: train_groups={train_groups}, val_groups={val_groups}, train_rows={train_split.height}, val_rows={val_split.height}"
     )
 
-    scaler = StandardScaler()
-    logger.info("스케일링을 시작합니다 (StandardScaler).")
-    x_train = scaler.fit_transform(to_numpy(train_split, feature_columns))
-    x_val = scaler.transform(to_numpy(val_split, feature_columns))
-    x_test = scaler.transform(to_numpy(test_df, feature_columns))
-    logger.info("스케일링을 완료했습니다.")
+    train_features_frame = train_split.select(feature_columns)
+    val_features_frame = val_split.select(feature_columns)
+    test_features_frame = test_df.select(feature_columns)
+
+    train_array = train_features_frame.to_numpy()
+    val_array = val_features_frame.to_numpy()
+    test_array = test_features_frame.to_numpy()
+
+    scaler: StandardScaler | None = None
+    if config.scale_features:
+        scaler = StandardScaler()
+        logger.info("스케일링을 시작합니다 (StandardScaler).")
+        x_train = scaler.fit_transform(train_array.astype(np.float32, copy=False))
+        x_val = scaler.transform(val_array.astype(np.float32, copy=False))
+        x_test = scaler.transform(test_array.astype(np.float32, copy=False))
+        logger.info("스케일링을 완료했습니다.")
+    else:
+        x_train = train_array.astype(np.float32, copy=False)
+        x_val = val_array.astype(np.float32, copy=False)
+        x_test = test_array.astype(np.float32, copy=False)
+        logger.info("스케일링을 생략하고 원본 피처를 사용합니다.")
 
     y_train = train_split.select(config.target_col).to_numpy().astype(np.float32).ravel()
     y_val = val_split.select(config.target_col).to_numpy().astype(np.float32).ravel()
@@ -265,4 +302,8 @@ def prepare_data(config: TrainingConfig) -> DataBundle:
         val_pv_indices=val_pv_indices,
         test_pv_indices=test_pv_indices,
         pv_id_mapping=pv_mapping,
+        train_frame=train_features_frame if config.is_tree_model else None,
+        val_frame=val_features_frame if config.is_tree_model else None,
+        test_frame=test_features_frame if config.is_tree_model else None,
+        categorical_features=tuple(categorical_features) if categorical_features else None,
     )
