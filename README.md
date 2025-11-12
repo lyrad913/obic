@@ -218,6 +218,7 @@ submission.to_csv('result_submssion.csv')
 - `uv sync`로 의존성을 설치한 뒤 `uv run python main.py`로 기본 학습 파이프라인을 실행합니다.
 - 주요 옵션은 `python main.py --help`로 확인할 수 있으며, `--max-epochs`, `--batch-size`, `--submission-name` 등을 통해 실험을 조정할 수 있습니다.
 - 파이프라인은 `polars`로 전처리를 수행하고 `pytorch-ignite`로 학습 루프를 관리합니다. 결과 제출 파일은 기본적으로 `artifacts/submission.csv`에 생성됩니다.
+- 트리 기반 3중 앙상블(Triple Boosting) 파이프라인은 `update` 패키지에 포함되어 있으며 `uv run python -m update.main --model-type triple_boosting --ensemble-method stacking --data-dir ../data` 형태로 실행할 수 있습니다. 별도의 옵션 없이 실행하면 `oibc/data`의 CSV를 사용해 `artifacts/submission.csv`를 생성합니다.
 
 
 ## 현재 리더보드
