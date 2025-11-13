@@ -17,14 +17,14 @@ from loguru import logger
 from sklearn.metrics import mean_absolute_error
 from sklearn.model_selection import GroupKFold
 
-from .config import TrainingConfig
-from .data import DataBundle, ensure_kst_time, prepare_data
-from .utils import set_seed
+from obic.update.config import TrainingConfig
+from obic.update.data_add import DataBundle, ensure_kst_time, prepare_data
+from obic.update.utils import set_seed
 
 
 def prepare_data_no_scaling(config: TrainingConfig) -> DataBundle:
     """스케일링 없는 데이터 준비"""
-    from .data import (
+    from .data_add import (
         preprocess_frames,
         select_numerical_columns,
         split_train_validation,
