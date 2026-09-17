@@ -233,118 +233,177 @@ def _compute_normalized_mae(y_true: np.ndarray, y_pred: np.ndarray, eps: float =
     return float(np.abs(y_true - y_pred).mean() / denominator * 100.0)
 
 
-def _run_hist_gradient_boosting(bundle: DataBundle, config: TrainingConfig) -> dict[str, Any]:
-    logger.info("HistGradientBoosting 기반 Two-Stage 모델을 학습합니다.")
+def _align_category_levels(df: pd.DataFrame | None, category_levels: dict[str, list[Any]]) -> pd.DataFrame | None:
+    if df is None or not category_levels:
+        return df
+    for column, levels in category_levels.items():
+        if column in df.columns:
+            df[column] = pd.Categorical(df[column], categories=levels)
+    return df
 
-    x_train = np.ascontiguousarray(bundle.x_train)
-    y_train = bundle.y_train
-    x_val = np.ascontiguousarray(bundle.x_val)
+
+def _run_lightgbm_inference_only(bundle: DataBundle, config: TrainingConfig) -> dict[str, Any]:
+    if config.checkpoint_path is None:
+        raise ValueError("inference-only 모드에서는 checkpoint_path를 지정해야 합니다.")
+    checkpoint_path = config.checkpoint_path
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    logger.info(f"LightGBM 체크포인트를 불러와 추론을 수행합니다: {checkpoint_path}")
+    payload = joblib.load(checkpoint_path)
+    classifier = payload.get("classifier")
+    if classifier is None:
+        raise ValueError("Checkpoint에는 classifier가 포함되어야 합니다.")
+    regressor = payload.get("regressor")
+    category_levels = payload.get("category_levels") or {}
+
+    val_df = bundle.val_frame.to_pandas() if bundle.val_frame is not None else None
+    test_df = bundle.test_frame.to_pandas()
+    if val_df is not None:
+        val_df = _align_category_levels(val_df, category_levels)
+    test_df = _align_category_levels(test_df, category_levels)
+
     y_val = bundle.y_val
-    x_test = np.ascontiguousarray(bundle.x_test)
-
-    threshold = config.positive_threshold
-    positive_ratio = float((y_train > threshold).mean())
-    logger.info(f"학습 타깃 양수 비율: {positive_ratio:.3f}")
-
-    if config.tree_subsample < 1.0:
-        full_size = x_train.shape[0]
-        subset_size = max(1, int(full_size * config.tree_subsample))
-        if subset_size < full_size:
-            rng = np.random.default_rng(config.seed)
-            indices = rng.choice(full_size, size=subset_size, replace=False)
-            x_train_sub = x_train[indices]
-            y_train_sub = y_train[indices]
-            logger.info(f"서브샘플링 적용: {subset_size}/{full_size} ({config.tree_subsample:.2f})")
-        else:
-            x_train_sub = x_train
-            y_train_sub = y_train
-    else:
-        x_train_sub = x_train
-        y_train_sub = y_train
-
-    y_train_binary = (y_train_sub > threshold).astype(np.int8)
-    classifier = HistGradientBoostingClassifier(
-        max_iter=config.tree_max_iter,
-        learning_rate=config.tree_learning_rate,
-        max_depth=config.tree_max_depth,
-        l2_regularization=config.tree_l2_regularization,
-        max_bins=config.tree_max_bins,
-        min_samples_leaf=config.tree_min_samples_leaf,
-        random_state=config.seed,
-    )
-    classifier.fit(x_train_sub, y_train_binary)
-    logger.info("분류 헤드 학습 완료")
-
-    positive_mask = y_train_sub > threshold
-    regressor: HistGradientBoostingRegressor | None = None
-    if positive_mask.any():
-        regressor = HistGradientBoostingRegressor(
-            max_iter=config.tree_max_iter,
-            learning_rate=config.tree_learning_rate,
-            max_depth=config.tree_max_depth,
-            l2_regularization=config.tree_l2_regularization,
-            max_bins=config.tree_max_bins,
-            min_samples_leaf=config.tree_min_samples_leaf,
-            random_state=config.seed,
-        )
-        regressor.fit(x_train_sub[positive_mask], y_train_sub[positive_mask])
-        logger.info("회귀 헤드 학습 완료")
-    else:
-        logger.warning("양수 샘플이 없어 회귀 헤드를 학습하지 못했습니다. 모든 예측을 0으로 대체합니다.")
-
-    prob_val = classifier.predict_proba(x_val)[:, 1]
-    reg_val = np.zeros_like(y_val, dtype=np.float64)
-    if regressor is not None:
-        reg_val = np.clip(regressor.predict(x_val), 0.0, None)
-    val_predictions = np.clip(prob_val * reg_val, 0.0, None)
-
-    val_mae = mean_absolute_error(y_val, val_predictions)
-    val_rmse = math.sqrt(mean_squared_error(y_val, val_predictions))
-    val_nmape = _compute_normalized_mae(y_val, val_predictions)
-
-    prob_test = classifier.predict_proba(x_test)[:, 1]
-    reg_test = np.zeros(x_test.shape[0], dtype=np.float64)
-    if regressor is not None:
-        reg_test = np.clip(regressor.predict(x_test), 0.0, None)
-    test_predictions = np.clip(prob_test * reg_test, 0.0, None).astype(np.float32)
-
-    checkpoint_manager = CheckpointManager(config)
-    payload = {
-        "classifier": classifier,
-        "regressor": regressor,
-        "threshold": threshold,
-        "metrics": {
+    val_metrics: dict[str, float] | None = None
+    if val_df is not None and y_val.size > 0:
+        prob_val = classifier.predict_proba(val_df)[:, 1]
+        reg_val = np.zeros_like(y_val, dtype=np.float64)
+        if regressor is not None:
+            reg_val = np.clip(regressor.predict(val_df), 0.0, None)
+        val_predictions = np.clip(prob_val * reg_val, 0.0, None)
+        val_mae = mean_absolute_error(y_val, val_predictions)
+        val_rmse = math.sqrt(mean_squared_error(y_val, val_predictions))
+        val_nmape = _compute_normalized_mae(y_val, val_predictions)
+        val_metrics = {
             "mae": val_mae,
             "rmse": val_rmse,
             "nmape": val_nmape,
-        },
-    }
-    checkpoint_path = checkpoint_manager.save_joblib(payload, val_mae, epoch=0)
-    if checkpoint_path is not None:
-        logger.info(f"모델을 저장했습니다: {checkpoint_path}")
+        }
+        logger.info(f"Validation metrics (inference-only): {json.dumps(val_metrics, default=float)}")
+
+    prob_test = classifier.predict_proba(test_df)[:, 1]
+    reg_test = np.zeros(test_df.shape[0], dtype=np.float64)
+    if regressor is not None:
+        reg_test = np.clip(regressor.predict(test_df), 0.0, None)
+    test_predictions = np.clip(prob_test * reg_test, 0.0, None).astype(np.float32, copy=False)
 
     submission_path = _save_submission(test_predictions, bundle, config)
-
-    metrics_payload = {
-        "mae": val_mae,
-        "rmse": val_rmse,
-        "nmape": val_nmape,
-    }
-    logger.info(f"Validation metrics: {json.dumps(metrics_payload, default=float)}")
     logger.info(f"Submission saved to {submission_path}")
 
     result: dict[str, Any] = {
         "device": "cpu",
         "feature_count": len(bundle.feature_names),
-        "val_metrics": metrics_payload,
         "submission_path": str(submission_path),
+        "loaded_checkpoint": str(checkpoint_path),
     }
-    if checkpoint_path is not None:
-        result["checkpoint_path"] = str(checkpoint_path)
+    if val_metrics is not None:
+        result["val_metrics"] = val_metrics
+    return result
+
+
+def _predict_lightgbm_heads(
+    classifier: Any,
+    regressor: Any | None,
+    frame: pd.DataFrame,
+) -> np.ndarray:
+    prob = classifier.predict_proba(frame)[:, 1]
+    reg = np.zeros(frame.shape[0], dtype=np.float64)
+    if regressor is not None:
+        reg = np.clip(regressor.predict(frame), 0.0, None)
+    return np.clip(prob * reg, 0.0, None)
+
+
+def _run_lightgbm_inference_only(bundle: DataBundle, config: TrainingConfig) -> dict[str, Any]:
+    checkpoint_paths: list[Path] = []
+    if config.checkpoint_paths is not None:
+        checkpoint_paths.extend(Path(p) for p in config.checkpoint_paths)
+    if config.checkpoint_path is not None:
+        checkpoint_paths.append(Path(config.checkpoint_path))
+    if not checkpoint_paths:
+        raise ValueError("inference-only 모드에서는 최소 하나 이상의 checkpoint를 지정해야 합니다.")
+
+    val_df_base = bundle.val_frame.to_pandas() if bundle.val_frame is not None else None
+    test_df_base = bundle.test_frame.to_pandas()
+    y_val = bundle.y_val
+
+    test_predictions_list: list[np.ndarray] = []
+    val_predictions_list: list[np.ndarray] = []
+    per_model_metrics: list[dict[str, Any]] = []
+
+    for path in checkpoint_paths:
+        if not path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {path}")
+        logger.info(f"Checkpoint 로드 및 추론: {path}")
+        payload = joblib.load(path)
+        classifier = payload.get("classifier")
+        if classifier is None:
+            raise ValueError(f"Checkpoint {path}에는 classifier가 포함되어야 합니다.")
+        regressor = payload.get("regressor")
+        category_levels = payload.get("category_levels") or {}
+
+        val_df = _align_category_levels(val_df_base.copy() if val_df_base is not None else None, category_levels)
+        test_df = _align_category_levels(test_df_base.copy(), category_levels)
+
+        model_test_pred = _predict_lightgbm_heads(classifier, regressor, test_df)
+        test_predictions_list.append(model_test_pred.astype(np.float32, copy=False))
+
+        if val_df is not None and y_val.size > 0:
+            model_val_pred = _predict_lightgbm_heads(classifier, regressor, val_df)
+            val_predictions_list.append(model_val_pred.astype(np.float64, copy=False))
+            val_mae = mean_absolute_error(y_val, model_val_pred)
+            val_rmse = math.sqrt(mean_squared_error(y_val, model_val_pred))
+            val_nmape = _compute_normalized_mae(y_val, model_val_pred)
+            metrics = {
+                "mae": val_mae,
+                "rmse": val_rmse,
+                "nmape": val_nmape,
+                "checkpoint": str(path),
+            }
+            per_model_metrics.append(metrics)
+            logger.info(f"Validation metrics (checkpoint={path.name}): {json.dumps(metrics, default=float)}")
+
+    if not test_predictions_list:
+        raise RuntimeError("No predictions were generated during inference-only execution.")
+
+    ensemble_test = np.mean(np.stack(test_predictions_list, axis=0), axis=0)
+
+    ensemble_val_metrics: dict[str, float] | None = None
+    if val_predictions_list:
+        ensemble_val = np.mean(np.stack(val_predictions_list, axis=0), axis=0)
+        val_mae = mean_absolute_error(y_val, ensemble_val)
+        val_rmse = math.sqrt(mean_squared_error(y_val, ensemble_val))
+        val_nmape = _compute_normalized_mae(y_val, ensemble_val)
+        ensemble_val_metrics = {
+            "mae": val_mae,
+            "rmse": val_rmse,
+            "nmape": val_nmape,
+        }
+        logger.info(
+            "Validation metrics (ensemble over %d checkpoints): %s",
+            len(checkpoint_paths),
+            json.dumps(ensemble_val_metrics, default=float),
+        )
+
+    submission_path = _save_submission(ensemble_test.astype(np.float32, copy=False), bundle, config)
+    logger.info(f"Submission saved to {submission_path}")
+
+    result: dict[str, Any] = {
+        "device": "cpu",
+        "feature_count": len(bundle.feature_names),
+        "submission_path": str(submission_path),
+        "loaded_checkpoints": [str(path) for path in checkpoint_paths],
+    }
+    if ensemble_val_metrics is not None:
+        result["val_metrics"] = ensemble_val_metrics
+    if per_model_metrics:
+        result["per_model_metrics"] = per_model_metrics
     return result
 
 
 def _run_lightgbm(bundle: DataBundle, config: TrainingConfig) -> dict[str, Any]:
+    if config.inference_only:
+        return _run_lightgbm_inference_only(bundle, config)
+
     if bundle.train_frame is None or bundle.val_frame is None or bundle.test_frame is None:
         raise ValueError("LightGBM 실행을 위해서는 train/val/test 프레임이 필요합니다.")
 
@@ -397,6 +456,7 @@ def _run_lightgbm(bundle: DataBundle, config: TrainingConfig) -> dict[str, Any]:
     val_df = val_pl.to_pandas()
     test_df = test_pl.to_pandas()
 
+    category_levels: dict[str, list[Any]] = {}
     for cat in cat_features:
         if cat not in train_df.columns:
             continue
@@ -412,6 +472,7 @@ def _run_lightgbm(bundle: DataBundle, config: TrainingConfig) -> dict[str, Any]:
         train_df[cat] = pd.Categorical(train_df[cat], categories=categories)
         val_df[cat] = pd.Categorical(val_df[cat], categories=categories)
         test_df[cat] = pd.Categorical(test_df[cat], categories=categories)
+    category_levels[cat] = categories.tolist()
 
     y_train_binary = (y_train_sub > threshold).astype(np.int8)
     y_val_binary = (y_val > threshold).astype(np.int8)
@@ -513,6 +574,7 @@ def _run_lightgbm(bundle: DataBundle, config: TrainingConfig) -> dict[str, Any]:
         "regressor": regressor,
         "threshold": threshold,
         "categorical_features": cat_features,
+        "category_levels": category_levels,
         "metrics": {
             "mae": val_mae,
             "rmse": val_rmse,
@@ -550,6 +612,13 @@ def run_pipeline(config: TrainingConfig) -> dict[str, Any]:
         config.scale_features = False
 
     config.resolve_paths()
+
+    if config.inference_only:
+        if not config.is_lightgbm:
+            raise ValueError("inference-only 모드는 현재 LightGBM 모델에서만 지원됩니다.")
+        if config.checkpoint_path is None and not config.checkpoint_paths:
+            raise ValueError("inference-only 모드에서는 최소 하나의 checkpoint를 지정해야 합니다.")
+
     set_seed(config.seed)
 
     bundle = prepare_data(config)

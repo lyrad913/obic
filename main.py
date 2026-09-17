@@ -48,6 +48,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lgbm-sample-fraction", type=float, default=None, help="Row sampling ratio applied before LightGBM training")
     parser.add_argument("--lgbm-early-stopping", type=int, default=None, help="Early stopping rounds for LightGBM")
     parser.add_argument("--lgbm-log-period", type=int, default=None, help="Log evaluation metric every n rounds for LightGBM (0 to disable)")
+    parser.add_argument("--inference-only", action="store_true", help="Skip training and run inference using a saved checkpoint")
+    parser.add_argument("--checkpoint-path", type=Path, default=None, help="Single checkpoint file to load when running in inference-only mode")
+    parser.add_argument(
+        "--checkpoint-paths",
+        type=Path,
+        action="append",
+        default=None,
+        help="Repeatable option to supply multiple checkpoint files for ensemble inference",
+    )
     return parser.parse_args()
 
 
@@ -126,6 +135,12 @@ def apply_overrides(config: TrainingConfig, args: argparse.Namespace) -> None:
         config.lgbm_early_stopping_rounds = args.lgbm_early_stopping
     if args.lgbm_log_period is not None:
         config.lgbm_log_evaluation_period = args.lgbm_log_period
+    if args.inference_only:
+        config.inference_only = True
+    if args.checkpoint_path is not None:
+        config.checkpoint_path = args.checkpoint_path
+    if args.checkpoint_paths:
+        config.checkpoint_paths = tuple(args.checkpoint_paths)
 
 
 def main() -> None:

@@ -52,6 +52,9 @@ class TrainingConfig:
     lgbm_sample_fraction: float = 0.4
     lgbm_early_stopping_rounds: int = 50
     lgbm_log_evaluation_period: int = 50
+    inference_only: bool = False
+    checkpoint_path: Path | None = None
+    checkpoint_paths: Sequence[Path] | None = None
 
     def resolve_paths(self) -> None:
         self.data_dir = Path(self.data_dir)
@@ -60,6 +63,10 @@ class TrainingConfig:
         checkpoints_root = self.artifacts_dir / "checkpoints"
         checkpoints_root.mkdir(parents=True, exist_ok=True)
         (checkpoints_root / self.model_name).mkdir(parents=True, exist_ok=True)
+        if self.checkpoint_path is not None:
+            self.checkpoint_path = Path(self.checkpoint_path)
+        if self.checkpoint_paths is not None:
+            self.checkpoint_paths = tuple(Path(p) for p in self.checkpoint_paths)
 
     @property
     def checkpoint_dir(self) -> Path:

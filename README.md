@@ -219,6 +219,24 @@ submission.to_csv('result_submssion.csv')
 - 주요 옵션은 `python main.py --help`로 확인할 수 있으며, `--max-epochs`, `--batch-size`, `--submission-name` 등을 통해 실험을 조정할 수 있습니다.
 - 파이프라인은 `polars`로 전처리를 수행하고 `pytorch-ignite`로 학습 루프를 관리합니다. 결과 제출 파일은 기본적으로 `artifacts/submission.csv`에 생성됩니다.
 
+### Inference-only & Ensemble 모드
+- LightGBM 학습이 완료된 후 저장된 체크포인트(`artifacts/checkpoints/lightgbm/*.joblib`)를 사용해 재학습 없이 추론할 수 있습니다.
+- 단일 체크포인트 추론 예시:
+    ```bash
+    uv run python main.py --model lightgbm --inference-only \
+        --checkpoint-path artifacts/checkpoints/lightgbm/ckpt_a.joblib \
+        --submission-name submission_infer.csv
+    ```
+- 여러 체크포인트를 전달하면 모델 별 예측을 평균내어 앙상블을 수행합니다. `--checkpoint-paths` 옵션은 반복해서 사용할 수 있습니다.
+    ```bash
+    uv run python main.py --model lightgbm --inference-only \
+        --checkpoint-paths artifacts/checkpoints/lightgbm/ckpt_a.joblib \
+        --checkpoint-paths artifacts/checkpoints/lightgbm/ckpt_b.joblib \
+        --checkpoint-path artifacts/checkpoints/lightgbm/ckpt_c.joblib \
+        --submission-name submission_ensemble.csv
+    ```
+- 추론 시에도 동일한 전처리 파이프라인을 다시 실행해 피처 스케일/카테고리를 맞추며, 검증 세트가 존재하면 개별 모델과 앙상블 결과에 대한 검증 지표를 로그로 남깁니다.
+
 
 ## 현재 리더보드
 |순위|팀명|MAE|NMAPE|MSE|MSLE|RMSE|제출수|제출일|
